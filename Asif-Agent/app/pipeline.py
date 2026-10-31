@@ -1,0 +1,765 @@
+"""The whole flow for one post. Every step saves its result, so a failed or interrupted post
+resumes from where it stopped instead of starting over.
+
+Post statuses:
+  queued → writing → imaging → designing → emailing     (being made)
+  pending_review                                        (waiting for approval)
+  scheduled                                             (approved or automatic; goes out at scheduled_for)
+  publishing → published | partly_published | publish_failed
+  failed (making it went wrong) · missed (server was offline at the time) · cancelled
+"""
+
+import asyncio
+import io
+import logging
+from datetime import timedelta
+
+from PIL import Image
+
+from . import emailer, publisher
+from .brand import load_brand
+from .composer import LAYOUT_NAMES, TEMPLATES, compose, face_fit, thumbnail
+from .faces import find_faces
+from .imagegen import pool
+from .industries import INDUSTRIES, industry_name, next_scene
+from .store import get_store
+from .timeutil import fmt, iso, now_utc, parse
+from .llm import transcribe
+from .uploads import media_label, pictures_for_ai
+from .variety import fingerprint, looks_like_earlier, make_plan, plan_label
+from .showcase import LAYOUTS as SHOWCASE_LAYOUTS, compose_showcase, cut_sheet
+from .showcase import face_fit as showcase_fit
+from .writer import (image_prompt, make_brief, make_clean_brief, make_copy, make_showcase_brief, make_upload_brief,
+                     showcase_prompts)
+
+log = logging.getLogger("pipeline")
+
+WORKING = ["queued", "writing", "imaging", "designing", "emailing"]
+CAN_REJECT = ["pending_review", "failed", "scheduled", "missed"]
+CAN_CANCEL = WORKING + ["pending_review", "scheduled", "missed", "failed"]
+CAN_PUBLISH_NOW = ["pending_review", "scheduled", "missed"]
+CAN_RESCHEDULE = WORKING + ["pending_review", "scheduled", "missed", "failed"]
+STAGE_LABEL = {
+    "queued": "Waiting to start", "writing": "Writing headline and captions", "imaging": "Creating the image with Gemini",
+    "designing": "Adding logo, headline and contact details", "emailing": "Sending the review email",
+    "pending_review": "Waiting for your approval", "publishing": "Publishing through Buffer",
+    "demo_ready": "Demo ready · preview and download only, never published",
+}
+LOOKING = "Looking at your media and writing the captions"
+LATE_LIMIT = timedelta(hours=3)  # a scheduled post more than this late is not published by itself
+VIDEO_KEEP = timedelta(days=7)  # a published or cancelled post's video file is removed from storage after this
+
+_tasks: set[asyncio.Task] = set()
+_running: set[str] = set()
+
+
+class Stopped(Exception):
+    """The post was cancelled while it was being made."""
+
+
+def spawn(coro) -> None:
+    task = asyncio.create_task(coro)
+    _tasks.add(task)
+    task.add_done_callback(_tasks.discard)
+
+
+def _now() -> str:
+    return iso(now_utc())
+
+
+async def note(post_id: str, what: str, by: str = "system") -> None:
+    """Add a line to the post's activity history (shown on its page). Never breaks the flow."""
+    try:
+        store = get_store()
+        events = list(await store.get_setting(f"events_{post_id}") or [])
+        events.append({"at": _now(), "what": what, "by": by})
+        await store.set_setting(f"events_{post_id}", events[-80:])
+    except Exception:
+        log.exception("Could not record activity for %s", post_id)
+
+
+async def events(post_id: str) -> list[dict]:
+    try:
+        return list(await get_store().get_setting(f"events_{post_id}") or [])
+    except Exception:
+        return []
+
+
+def is_upload(post: dict) -> bool:
+    """The client's own photo(s) or video: nothing is designed, the AI only writes the text."""
+    return (post.get("prefs") or {}).get("mode") == "upload"
+
+
+async def _stage(post_id: str, status: str, label: str | None = None) -> dict:
+    """Move to the next making step. Raises Stopped if the post was cancelled meanwhile."""
+    post = await get_store().claim(post_id, WORKING, status, stage_note=label or STAGE_LABEL[status], error=None)
+    if not post:
+        raise Stopped()
+    return post
+
+
+async def variety_history(current_id: str) -> list[dict]:
+    """Every earlier post and every rejected version, newest first, for the no-repeat checks.
+    For the post being made, only its rejected versions count (the new version must differ from them)."""
+    out = []
+    for p in await get_store().list_posts(300):
+        if p["id"] != current_id and p.get("brief") and is_upload(p):
+            out.append({"brief": None, "captions": p.get("captions")})  # no headline or picture to compare with
+        elif p["id"] != current_id and p.get("brief"):
+            out.append({"brief": p["brief"], "captions": p.get("captions")})
+        for h in reversed(p.get("history") or []):
+            if h.get("brief"):
+                out.append({"brief": h["brief"], "captions": h.get("captions")})
+    return out
+
+
+async def generate(post_id: str) -> None:
+    """Idea → brief → captions → image → finished design → review email."""
+    if post_id in _running:
+        return
+    _running.add(post_id)
+    store, brand = get_store(), load_brand()
+    try:
+        post = await store.get_post(post_id)
+        if not post or post["status"] not in WORKING:
+            return
+        stage = post["status"]
+        try:
+            history = post.get("history") or []
+            feedback = {"reason": post.get("reject_reason"), "brief": history[-1].get("brief")} if history else None
+            v = post["attempt"]
+            past = await variety_history(post_id)
+            prefs = post.get("prefs") or {}
+            idea = "" if post["idea"].startswith("Auto: ") else post["idea"]
+            mode = prefs.get("mode") or ("idea" if idea else "auto")
+            demo = INDUSTRIES.get(prefs.get("industry")) and mode == "demo"
+            # industry demos and a typed idea with "Simple photo" use the clean style; everything else gets a brand
+            # layout (a typed idea that isn't about one of the services becomes a simple photo after its brief)
+            clean = bool(demo) or (post.get("template_pref") == "clean" and bool(idea))
+            showcase = prefs.get("style") == "showcase"
+
+            if showcase and (not post.get("brief") or not post.get("captions")):
+                # the Showcase post: an infographic poster with several photos
+                stage = "writing"
+                post = await _stage(post_id, stage)
+                plan = prefs.get("plan")
+                if not plan:
+                    plan = make_plan(past, prefs.get("service"), None, None, brand)
+                    prefs = {**prefs, "plan": plan}
+                    post = await store.update_post(post_id, prefs=prefs)
+                if not post.get("brief"):
+                    layout = post.get("template_pref") if post.get("template_pref") in SHOWCASE_LAYOUTS else \
+                        next_showcase_layout(past)
+                    brief = await make_showcase_brief(brand, idea, plan, past, layout, feedback, prefs.get("message") or "")
+                    post = await store.update_post(post_id, brief=brief)
+                try:
+                    platforms = await publisher.caption_platforms()
+                except Exception as e:
+                    platforms = None
+                    log.warning("Could not read the Buffer channels (%s); using POST_PLATFORMS", e)
+                captions = await make_copy(brand, idea, post["brief"], plan, past, feedback, platforms)
+                post = await store.update_post(post_id, captions=captions)
+
+            if showcase and (not post.get("raw_image_path") or not post["brief"].get("_photos")):
+                stage = "imaging"
+                post = await _stage(post_id, stage, "Creating the photos with Gemini (2 pictures)")
+                hero_prompt, sheet_prompt = showcase_prompts(brand, post["brief"])
+                if not post.get("raw_image_path"):
+                    raw, slot = await pool.generate(hero_prompt)
+                    path = f"{post_id}/v{v}-raw.png"
+                    await store.save_file(path, raw, "image/png")
+                    post = await store.update_post(post_id, raw_image_path=path,
+                                                   brief={**post["brief"], "_gemini_account": slot, "_fingerprint": fingerprint(raw)})
+                photos = await _showcase_photos(post_id, post, sheet_prompt, v)
+                post = await store.update_post(post_id, brief={**post["brief"], "_photos": photos})
+
+            if mode == "upload" and (not post.get("brief") or not post.get("captions")):
+                # the client's own photo(s) or video: the AI looks at it and writes the title and captions
+                stage = "writing"
+                post = await _stage(post_id, stage, LOOKING)
+                media, note_text = prefs["media"], prefs.get("note") or ""
+                if not post.get("brief"):
+                    paths = prefs["media"].get("frames") if media["kind"] == "video" else [i["path"] for i in media["items"]]
+                    pictures = await asyncio.to_thread(pictures_for_ai, [await store.read_file(p) for p in paths])
+                    spoken = ""
+                    if media["kind"] == "video" and media["video"]["size"] <= 25 * 1024 * 1024:
+                        spoken = await transcribe(await store.read_file(media["video"]["path"]), "video.mp4")
+                    brief = await make_upload_brief(brand, media, pictures, note_text, prefs.get("service"), spoken)
+                    post = await store.update_post(post_id, brief=brief)
+                try:  # a caption for every platform connected in Buffer right now
+                    platforms = await publisher.caption_platforms()
+                except Exception as e:
+                    platforms = None
+                    log.warning("Could not read the Buffer channels (%s); using POST_PLATFORMS", e)
+                captions = await make_copy(brand, note_text, post["brief"], {}, past, feedback, platforms,
+                                           mode="upload", media=media["kind"])
+                post = await store.update_post(post_id, captions=captions)
+
+            if clean and (not post.get("brief") or not post.get("captions")):
+                stage = "writing"
+                post = await _stage(post_id, stage)
+                note_text = prefs.get("note") or ""
+                industry = industry_name(prefs["industry"]) if demo else None
+                if not post.get("brief"):
+                    if demo:
+                        made = sum(1 for h in past if (h.get("brief") or {}).get("_industry") == industry)
+                        brief = await make_clean_brief(brand, note_text, past, feedback, industry=industry,
+                                                       scene=next_scene(prefs["industry"], made))
+                    else:
+                        brief = await make_clean_brief(brand, idea, past, feedback, service=prefs.get("service"),
+                                                       message=prefs.get("message") or "")
+                    post = await store.update_post(post_id, brief=brief)
+                platforms = None
+                if not demo:
+                    try:  # a caption for every platform connected in Buffer right now
+                        platforms = await publisher.caption_platforms()
+                    except Exception as e:
+                        log.warning("Could not read the Buffer channels (%s); using POST_PLATFORMS", e)
+                captions = await make_copy(brand, idea or note_text, post["brief"], {}, past, feedback, platforms,
+                                           mode="demo" if demo else "idea", industry=industry)
+                post = await store.update_post(post_id, captions=captions)
+
+            if not post.get("brief") or not post.get("captions"):
+                stage = "writing"
+                post = await _stage(post_id, stage)
+                plan = prefs.get("plan")
+                if not plan:
+                    plan = make_plan(past, prefs.get("service"), prefs.get("post_type"),
+                                     None if post.get("template_pref") == "clean" else post.get("template_pref"), brand)
+                    prefs = {**prefs, "plan": plan}
+                    post = await store.update_post(post_id, prefs=prefs)
+                if not post.get("brief"):
+                    brief = await make_brief(brand, idea, plan, past, feedback, message=prefs.get("message") or "")
+                    if post.get("template_pref") == "clean" or (
+                            mode == "idea" and not post.get("template_pref") and not prefs.get("service")
+                            and brief.get("service") == "General"):
+                        brief = {**brief, "template": "clean"}  # not about a service (a limo, a greeting): simple photo
+                    post = await store.update_post(post_id, brief=brief)
+                try:  # write a caption for every platform connected in Buffer right now
+                    platforms = await publisher.caption_platforms()
+                except Exception as e:
+                    platforms = None  # Buffer not reachable: the POST_PLATFORMS setting is used
+                    log.warning("Could not read the Buffer channels (%s); using POST_PLATFORMS", e)
+                simple_idea = mode == "idea" and post["brief"].get("template") == "clean"
+                captions = await make_copy(brand, idea, post["brief"], plan, past, feedback, platforms,
+                                           mode="idea" if simple_idea else "brand")
+                post = await store.update_post(post_id, captions=captions)
+
+            if not post.get("raw_image_path"):
+                stage = "imaging"
+                post = await _stage(post_id, stage)
+                prompt = image_prompt(brand, post["brief"])
+                raw, slot = await pool.generate(prompt)
+                fp = fingerprint(raw)
+                if looks_like_earlier(fp, past):
+                    # almost the same picture as an earlier post: ask once more for a clearly different one
+                    raw, slot = await pool.generate(
+                        prompt + "\nMake it clearly different from typical stock images: a new angle, a different "
+                                 "person and a different place."
+                    )
+                    fp = fingerprint(raw)
+                path = f"{post_id}/v{v}-raw.png"
+                await store.save_file(path, raw, "image/png")
+                post = await store.update_post(post_id, raw_image_path=path,
+                                               brief={**post["brief"], "_gemini_account": slot, "_fingerprint": fp})
+
+            if not post.get("final_image_url"):
+                stage = "designing"
+                post = await _stage(post_id, stage)
+                raw = await store.read_file(post["raw_image_path"])
+                if "_faces" not in post["brief"]:
+                    post = await store.update_post(post_id, brief=await _face_check(post_id, post["brief"], raw))
+                layout = post["brief"]["template"]
+                final = await render_design(post, layout)
+                path = f"{post_id}/v{v}-{layout}.jpg"  # a new address per layout: no browser shows an old copy
+                url = await store.save_file(path, final, "image/jpeg")
+                thumb = await asyncio.to_thread(thumbnail, final)
+                thumb_url = await store.save_file(f"{post_id}/v{v}-{layout}-thumb.jpg", thumb, "image/jpeg")
+                post = await store.update_post(post_id, final_image_path=path, final_image_url=url,
+                                               brief={**post["brief"], "_thumb": thumb_url})
+
+            if demo:  # demos are only for showing prospects: no email, never published
+                await store.claim(post_id, WORKING, "demo_ready", stage_note=STAGE_LABEL["demo_ready"], error=None)
+                await note(post_id, "Demo ready: preview and download only, never published")
+                return
+
+            stage = "emailing"
+            post = await _stage(post_id, stage)
+            image = await store.read_file(post["final_image_path"])
+            when = parse(post.get("scheduled_for"))
+            if (post.get("prefs") or {}).get("auto_publish") and when:
+                # fully automatic: the email is only a heads-up, so a failed email must not stop the post
+                try:
+                    await emailer.send_review(post, image)
+                    await note(post_id, f"Version {v} ready · heads-up email sent (publishes automatically {fmt(when)})")
+                except Exception as e:
+                    log.exception("Heads-up email for automatic post %s failed", post_id)
+                    await note(post_id, f"Version {v} ready · heads-up email could not be sent ({e})")
+                await store.claim(post_id, ["emailing"], "scheduled", stage_note=f"Publishes automatically · {fmt(when)}")
+                spawn(prepare_layouts(post_id))
+            else:
+                # the dashboard can always approve it, so a failed email must not lose the post
+                email_problem = None
+                try:
+                    await emailer.send_review(post, image)
+                    await note(post_id, f"Version {v} ready · review email sent")
+                except Exception as e:
+                    log.exception("Review email for post %s failed", post_id)
+                    email_problem = (f"The review email could not be sent ({type(e).__name__}: {e}). "
+                                     "Approve or reject it here on the dashboard.")
+                    await note(post_id, f"Version {v} ready · review email could NOT be sent: {e}")
+                waiting = f"Waiting for your approval · for {fmt(when)}" if when else STAGE_LABEL["pending_review"]
+                await store.claim(post_id, ["emailing"], "pending_review", stage_note=waiting, error=email_problem)
+                spawn(prepare_layouts(post_id))  # previews for "Try other layouts", made after the email is out
+        except Stopped:
+            log.info("Post %s was cancelled while being made", post_id)
+        except Exception as e:
+            log.exception("Post %s failed while %s", post_id, stage)
+            failed = await store.claim(post_id, WORKING, "failed", error=f"{type(e).__name__}: {e}",
+                                       stage_note=f"Failed while: {STAGE_LABEL.get(stage, stage).lower()}")
+            if failed:
+                await note(post_id, f"Failed while {STAGE_LABEL.get(stage, stage).lower()}: {type(e).__name__}: {str(e)[:160]}")
+                await emailer.alert_post_failed(failed)
+    finally:
+        _running.discard(post_id)
+
+
+async def create(idea: str, template_pref: str | None, service: str | None = None, post_type: str | None = None,
+                 scheduled_for=None, source: str = "manual", auto_publish: bool = False,
+                 if_no_answer: str = "wait", by: str = "dashboard", industry: str | None = None,
+                 message: str = "", style: str = "normal") -> dict:
+    """Everything is optional: with no idea and everything on Auto, the planner picks a fresh topic.
+    scheduled_for (UTC datetime) = when it should go out; None = right after approval."""
+    brand = load_brand()
+    prefs = {"service": service if service and brand.service(service) else None, "post_type": post_type or None,
+             "source": source, "auto_publish": bool(auto_publish and scheduled_for), "if_no_answer": if_no_answer}
+    idea = idea.strip()
+    message = (message or "").strip()[:150]
+    if message:
+        prefs["message"] = message
+        idea = idea or message  # only a message: it is also what the post and the picture are about
+    if industry in INDUSTRIES:  # an industry demo: the typed text is only a note for the picture
+        prefs.update(mode="demo", industry=industry, note=idea, source="demo")
+        idea, template_pref, scheduled_for = f"Demo: {industry_name(industry)}", None, None
+    else:
+        prefs["mode"] = "idea" if idea else "auto"
+        if style == "showcase":
+            prefs["style"] = "showcase"
+    store = get_store()
+    post = await store.create_post(idea, template_pref or None, prefs, iso(scheduled_for) if scheduled_for else None)
+    if not idea:
+        plan = make_plan(await variety_history(post["id"]), prefs["service"], prefs["post_type"], template_pref, brand)
+        post = await store.update_post(post["id"], idea=f"Auto: {plan_label(plan)}", prefs={**prefs, "plan": plan})
+    what = "Created by the daily schedule" if source == "schedule" else (
+        f"Industry demo: {industry_name(industry)}" if prefs.get("mode") == "demo" else
+        f"Created from the idea “{idea}”" if idea else "Created with an Auto topic")
+    if prefs.get("style") == "showcase":
+        what = "✨ Showcase post · " + what
+    if scheduled_for:
+        what += f" · to go out {fmt(scheduled_for)}" + (" automatically" if prefs["auto_publish"] else "")
+    await note(post["id"], what, "schedule" if source == "schedule" else by)
+    spawn(generate(post["id"]))
+    return post
+
+
+# ---------- Showcase posts ----------
+
+def next_showcase_layout(history: list[dict]) -> str:
+    """The Showcase layout used longest ago (so they take turns)."""
+    used = [(h.get("brief") or {}).get("template") for h in history]  # newest first
+    order = list(SHOWCASE_LAYOUTS)
+    return min(order, key=lambda t: (t in used, -used.index(t) if t in used else 0, order.index(t)))
+
+
+async def _showcase_photos(post_id: str, post: dict, sheet_prompt: str, v: int) -> dict:
+    """One Gemini picture with 9 photos, cut into the side, "why" and service photos. If the sheet can't be cut
+    (twice), photos of earlier posts are used, so the post is still made."""
+    store = get_store()
+    cells = None
+    for attempt in range(2):
+        sheet, _ = await pool.generate(sheet_prompt if not attempt else sheet_prompt +
+                                       "\nIMPORTANT: a clean 3 by 3 grid of 9 separate photos with white lines between them.")
+        await store.save_file(f"{post_id}/v{v}-sheet{attempt + 1}.png", sheet, "image/png")
+        cells = await asyncio.to_thread(cut_sheet, sheet)
+        if cells:
+            break
+    if not cells:
+        await note(post_id, "The photo sheet could not be cut into photos; photos from earlier posts are used for the tiles")
+        library = [p["raw_image_path"] for p in await store.list_posts(60)
+                   if p["id"] != post_id and p.get("raw_image_path") and not is_upload(p)][:9]
+        paths = (library + [post["raw_image_path"]] * 9)[:9]
+    else:
+        paths = []
+        for n, cell in enumerate(cells, 1):
+            paths.append(f"{post_id}/v{v}-p{n}.jpg")
+            await store.save_file(paths[-1], cell, "image/jpeg")
+    return {"tiles": paths[:5] + [paths[8]], "side1": paths[5], "side2": paths[6], "why": paths[7]}
+
+
+def is_showcase(brief: dict | None) -> bool:
+    return str((brief or {}).get("template") or "").startswith("sc_")
+
+
+async def render_design(post: dict, layout: str, brief: dict | None = None) -> bytes:
+    """The finished design of this post in this layout (the same picture and words)."""
+    store, brief = get_store(), {**(brief or post["brief"]), "template": layout}
+    raw = await store.read_file(post["raw_image_path"])
+    if layout in SHOWCASE_LAYOUTS:
+        ph = brief["_photos"]
+        photos = {"hero": raw, "side1": await store.read_file(ph["side1"]), "side2": await store.read_file(ph["side2"]),
+                  "why": await store.read_file(ph["why"]), "tiles": [await store.read_file(t) for t in ph["tiles"]]}
+        return await asyncio.to_thread(compose_showcase, layout, photos, brief, load_brand())
+    return await asyncio.to_thread(compose, layout, raw, brief, load_brand())
+
+
+# ---------- layouts: faces stay free; the client can switch layout (same picture, same text) ----------
+
+ALL_LAYOUTS = (*TEMPLATES, "clean")
+
+
+def layouts_for(brief: dict | None) -> tuple:
+    """The layouts a post can switch between: the 4 Showcase layouts for a Showcase post, the others otherwise."""
+    return tuple(SHOWCASE_LAYOUTS) if is_showcase(brief) else ALL_LAYOUTS
+
+
+def layout_fit(layout: str, brief: dict, size) -> float:
+    return showcase_fit(layout, brief, size) if layout in SHOWCASE_LAYOUTS else face_fit(layout, brief, size)
+FACE_OK = 0.05  # a layout may cover at most this share of the faces (a hair's edge, not a face)
+_preview_locks: dict[str, asyncio.Lock] = {}
+
+
+def pick_layout(brief: dict) -> str:
+    """The planned layout if it keeps every face free, otherwise the next layout that does."""
+    current, size = brief["template"], brief.get("_photo_size") or (1024, 1024)
+    if current == "clean" or layout_fit(current, brief, size) <= FACE_OK:
+        return current
+    family = tuple(SHOWCASE_LAYOUTS) if is_showcase(brief) else TEMPLATES
+    start = family.index(current) if current in family else 0
+    order = family[start + 1:] + family[:start]
+    fits = [(layout_fit(t, brief, size), i, t) for i, t in enumerate(order)]
+    good = [f for f in fits if f[0] <= FACE_OK]
+    return (good or sorted(fits))[0][2]
+
+
+async def _face_check(post_id: str, brief: dict, raw: bytes) -> dict:
+    """Find the faces in the picture once; switch to another layout if the planned one would cover a face."""
+    img = Image.open(io.BytesIO(raw))
+    faces = await asyncio.to_thread(find_faces, img)
+    brief = {**brief, "_faces": faces, "_photo_size": list(img.size)}
+    if faces and not brief.get("_layout_by_client"):
+        better = await asyncio.to_thread(pick_layout, brief)
+        if better != brief["template"]:
+            await note(post_id, f"{LAYOUT_NAMES.get(brief['template'], brief['template'])} would cover a face in this "
+                                f"picture → using {LAYOUT_NAMES.get(better, better)}")
+            brief["template"] = better
+    elif faces and layout_fit(brief["template"], brief, brief["_photo_size"]) > FACE_OK:
+        await note(post_id, f"Note: {LAYOUT_NAMES.get(brief['template'])} covers part of a face in this picture")
+    return brief
+
+
+def can_switch_layout(post: dict) -> bool:
+    return (post.get("status") == "pending_review" and not is_upload(post) and bool(post.get("brief"))
+            and bool(post.get("raw_image_path")) and bool(post.get("captions")))
+
+
+def layout_options(post: dict) -> list[dict]:
+    """Every layout for this post: its name, whether it is the current one, and whether it would cover a face."""
+    brief = post.get("brief") or {}
+    size = brief.get("_photo_size") or (1024, 1024)
+    return [{"key": t, "name": LAYOUT_NAMES[t], "current": t == brief.get("template"),
+             "covers_face": layout_fit(t, brief, size) > FACE_OK} for t in layouts_for(brief)]
+
+
+async def layout_preview(post: dict, layout: str) -> str:
+    """A small picture of this post in another layout (made once, then kept). Returns its address."""
+    store = get_store()
+    key = f"alts_{post['id']}_{post['attempt']}"
+    done = await store.get_setting(key) or {}
+    if layout in done:
+        return done[layout]
+    lock = _preview_locks.setdefault(post["id"], asyncio.Lock())
+    async with lock:  # one at a time per post (the server is small)
+        done = await store.get_setting(key) or {}
+        if layout in done:
+            return done[layout]
+        full = await render_design(post, layout)
+        small = await asyncio.to_thread(thumbnail, full, 420)
+        url = await store.save_file(f"{post['id']}/v{post['attempt']}-alt-{layout}.jpg", small, "image/jpeg")
+        await store.set_setting(key, {**(await store.get_setting(key) or {}), layout: url})
+        return url
+
+
+_preparing: set[str] = set()
+
+
+async def prepare_layouts(post_id: str) -> None:
+    """Make every layout preview in the background, so "Try other layouts" opens quickly."""
+    if post_id in _preparing:
+        return
+    _preparing.add(post_id)
+    try:
+        post = await get_store().get_post(post_id)
+        for layout in layouts_for((post or {}).get("brief")):
+            post = await get_store().get_post(post_id)
+            if not post or post["status"] not in ("pending_review", "scheduled") or not can_preview(post):
+                return
+            try:
+                await layout_preview(post, layout)
+            except Exception:
+                log.exception("Layout preview %s for %s failed", layout, post_id)
+    finally:
+        _preparing.discard(post_id)
+
+
+async def ready_previews(post: dict) -> dict[str, str]:
+    """The previews already made, {layout: address}, read in one go so the page links straight to the pictures
+    (no slow round trip through the server per picture). Starts making the missing ones in the background."""
+    done = dict(await get_store().get_setting(f"alts_{post['id']}_{post['attempt']}") or {})
+    if (post.get("brief") or {}).get("_thumb") and post["brief"].get("template") not in done:
+        done[post["brief"]["template"]] = post["brief"]["_thumb"]  # the current design's own small picture
+    if any(layout not in done for layout in layouts_for(post.get("brief"))) and can_preview(post):
+        spawn(prepare_layouts(post["id"]))
+    return done
+
+
+def can_preview(post: dict) -> bool:
+    brief = post.get("brief")
+    return (not is_upload(post) and bool(brief) and bool(post.get("raw_image_path"))
+            and (not is_showcase(brief) or bool(brief.get("_photos"))))
+
+
+async def switch_layout(post_id: str, layout: str, by: str = "dashboard") -> dict | None:
+    """Show the same picture and text in another layout; a new approval email follows."""
+    post = await get_store().get_post(post_id)
+    if not post or layout not in layouts_for(post.get("brief")) or not can_switch_layout(post):
+        return None
+    if post["brief"].get("template") == layout:
+        return post
+    old = post["brief"].get("template")
+    brief = {**post["brief"], "template": layout, "_layout_by_client": True}
+    post = await get_store().claim(post_id, ["pending_review"], "queued", brief=brief, final_image_path=None,
+                                   final_image_url=None, error=None, stage_note=f"Changing the layout to {LAYOUT_NAMES[layout]}")
+    if post:
+        await note(post_id, f"Layout changed: {LAYOUT_NAMES.get(old, old)} → {LAYOUT_NAMES[layout]}", by)
+        spawn(generate(post_id))
+    return post
+
+
+async def create_upload(media: dict, note_text: str = "", service: str | None = None, scheduled_for=None,
+                        by: str = "dashboard") -> dict:
+    """A post from the client's own photo, carousel or video (already checked and stored, see uploads.py).
+    The AI looks at it and writes the title and captions; then the usual approval email and publishing."""
+    brand = load_brand()
+    prefs = {"mode": "upload", "media": media, "note": note_text.strip(), "source": "upload", "post_type": None,
+             "service": service if service and brand.service(service) else None, "auto_publish": False,
+             "if_no_answer": "wait"}
+    label = media_label(media)
+    store = get_store()
+    post = await store.create_post(note_text.strip() or f"Your {label}", None, prefs,
+                                   iso(scheduled_for) if scheduled_for else None)
+    cover = media["poster"] if media["kind"] == "video" else media["items"][0]
+    post = await store.update_post(post["id"], raw_image_path=cover["path"], final_image_path=cover["path"],
+                                   final_image_url=cover["url"])
+    await note(post["id"], f"Uploaded your {label}" + (f" · to go out {fmt(scheduled_for)}" if scheduled_for else ""), by)
+    spawn(generate(post["id"]))
+    return post
+
+
+async def remove_old_videos(now=None) -> int:
+    """Videos fill the storage fast (Supabase's free plan holds 1 GB). A week after a video post was published or
+    cancelled, its video file is removed; the networks keep their own copy, and the cover and captions stay here."""
+    store = get_store()
+    now = now or now_utc()
+    removed = 0
+    for post in await store.posts_in_status(["published", "cancelled"]):
+        prefs = post.get("prefs") or {}
+        video = (prefs.get("media") or {}).get("video")
+        done = parse(post.get("published_at") or post.get("updated_at"))
+        if not video or video.get("removed") or not done or now - done < VIDEO_KEEP:
+            continue
+        try:
+            await store.delete_file(video["path"])
+        except Exception:
+            log.exception("Could not remove the old video of %s", post["id"])
+            continue
+        media = {**prefs["media"], "video": {**video, "removed": iso(now)}}
+        await store.update_post(post["id"], prefs={**prefs, "media": media})
+        await note(post["id"], "Video file removed from storage after a week (the social networks keep their copy)")
+        removed += 1
+    return removed
+
+
+async def retry(post_id: str, by: str = "dashboard") -> dict | None:
+    store = get_store()
+    post = await store.get_post(post_id)
+    if not post:
+        return None
+    if post["status"] == "failed":
+        post = await store.claim(post_id, ["failed"], "queued", error=None, stage_note="Retrying")
+        if post:
+            await note(post_id, "Retry pressed · continuing from the step that failed", by)
+            spawn(generate(post_id))
+        return post
+    if post["status"] in ("publish_failed", "partly_published"):
+        await note(post_id, "Retry pressed · publishing again to the channels that failed", by)
+        spawn(_publish(post_id, ["publish_failed", "partly_published"], retry_failed_only=True))
+    return post
+
+
+async def reject(post_id: str, reason: str, by: str = "dashboard") -> dict | None:
+    """Keep the rejected version in history and make a new one (same publish time, new plan)."""
+    store = get_store()
+    post = await store.get_post(post_id)
+    if not post or post["status"] not in CAN_REJECT:
+        return None
+    history = (post.get("history") or []) + [{
+        "attempt": post["attempt"], "brief": post.get("brief"), "captions": post.get("captions"),
+        "final_image_url": post.get("final_image_url"), "reason": reason, "at": _now(),
+    }]
+    prefs = {**(post.get("prefs") or {}), "plan": None}
+    # the client's own photo or video stays: only the text is written again (what the AI saw is kept too)
+    redo = (dict(brief=post.get("brief")) if is_upload(post) else
+            dict(brief=None, raw_image_path=None, final_image_path=None, final_image_url=None))
+    post = await store.claim(
+        post_id, CAN_REJECT, "queued", attempt=post["attempt"] + 1, reject_reason=reason or None,
+        history=history, prefs=prefs, captions=None, error=None, stage_note="Rejected; making a new version",
+        reviewed_at=_now(), **redo,
+    )
+    if post:
+        what = "writing new captions for" if is_upload(post) else "making"
+        await note(post_id, f"Rejected{f' (“{reason}”)' if reason else ''} → {what} version {post['attempt']}", by)
+        spawn(generate(post_id))
+    return post
+
+
+async def approve(post_id: str, by: str = "dashboard") -> dict | None:
+    """Approve a post. With a future publish time it waits ('scheduled'); otherwise it goes out now."""
+    store = get_store()
+    post = await store.get_post(post_id)
+    if not post or post["status"] != "pending_review":
+        return None
+    when = parse(post.get("scheduled_for"))
+    if when and when > now_utc() + timedelta(minutes=1):
+        done = await store.claim(post_id, ["pending_review"], "scheduled", reviewed_at=_now(), error=None,
+                                 stage_note=f"Approved · publishes {fmt(when)}")
+        if done:
+            await note(post_id, f"Approved → waits and goes out {fmt(when)}", by)
+        return done
+    return await _publish(post_id, ["pending_review"], why="Approved → publishing now", by=by)
+
+
+async def publish_now(post_id: str, by: str = "dashboard") -> dict | None:
+    return await _publish(post_id, CAN_PUBLISH_NOW, why="Publish now pressed", by=by)
+
+
+async def cancel(post_id: str, by: str = "dashboard") -> dict | None:
+    done = await get_store().claim(post_id, CAN_CANCEL, "cancelled", stage_note="Cancelled", error=None)
+    if done:
+        await note(post_id, "Cancelled · nothing will be published", by)
+    return done
+
+
+async def reschedule(post_id: str, when, by: str = "dashboard") -> dict | None:
+    """Give a post a new publish time (UTC datetime, must be in the future)."""
+    store = get_store()
+    post = await store.get_post(post_id)
+    if not post or post["status"] not in CAN_RESCHEDULE or when <= now_utc():
+        return None
+    await note(post_id, f"Publish time changed to {fmt(when)}", by)
+    if post["status"] == "missed":
+        return await store.claim(post_id, ["missed"], "scheduled", scheduled_for=iso(when), error=None,
+                                 stage_note=f"Approved · publishes {fmt(when)}")
+    stage_text = {"scheduled": f"Approved · publishes {fmt(when)}",
+                  "pending_review": f"Waiting for your approval · for {fmt(when)}"}.get(post["status"], post.get("stage_note"))
+    if post["status"] == "scheduled" and (post.get("prefs") or {}).get("auto_publish"):
+        stage_text = f"Publishes automatically · {fmt(when)}"
+    return await store.update_post(post_id, scheduled_for=iso(when), stage_note=stage_text)
+
+
+async def _publish(post_id: str, from_statuses: list[str], retry_failed_only: bool = False,
+                   why: str | None = None, by: str = "system") -> dict | None:
+    """Publish through Buffer. The status claim makes sure a post is never published twice."""
+    store = get_store()
+    post = await store.claim(post_id, from_statuses, "publishing", stage_note=STAGE_LABEL["publishing"],
+                             reviewed_at=_now(), error=None)
+    if not post:
+        return None
+    if why:
+        await note(post_id, why, by)
+    try:
+        only = None
+        previous = (post.get("publish_results") or {}).get("channels", [])
+        if retry_failed_only and previous:
+            only = [r["channel_id"] for r in previous if not r.get("ok") and not r.get("skipped")]
+        # a post with a publish time goes out now (its time has come); others follow PUBLISH_MODE
+        mode = "shareNow" if post.get("scheduled_for") else None
+        result = await publisher.publish(post["captions"], post["final_image_url"], only, mode=mode,
+                                         media=(post.get("prefs") or {}).get("media"))
+        if only:
+            done = {r["channel_id"]: r for r in previous}
+            done.update({r["channel_id"]: r for r in result["channels"]})
+            result["channels"] = list(done.values())
+        # a channel that can't take this kind of post (e.g. a video on Google Business) is skipped, not failed
+        oks = [r["ok"] for r in result["channels"] if not r.get("skipped")]
+        if not oks:
+            raise publisher.BufferError("None of the connected channels can take this post: "
+                                        + "; ".join(f"{r['label']}: {r['error']}" for r in result["channels"]))
+        status = "published" if all(oks) else ("partly_published" if any(oks) else "publish_failed")
+        post = await store.update_post(post_id, status=status, publish_results=result, error=None,
+                                       published_at=_now() if any(oks) else None,
+                                       stage_note={"published": "Published", "partly_published": "Some platforms failed",
+                                                   "publish_failed": "Publishing failed"}[status])
+    except Exception as e:
+        log.exception("Publishing %s failed", post_id)
+        post = await store.update_post(post_id, status="publish_failed", error=f"{type(e).__name__}: {e}",
+                                       stage_note="Publishing failed")
+    channels = (post.get("publish_results") or {}).get("channels", [])
+    sent_to = ", ".join(f"{r['label']} ({r['name']})" for r in channels if r.get("ok"))
+    problems = "; ".join(f"{r['label']} ({r['name']}): {r.get('error')}" for r in channels
+                         if not r.get("ok") and not r.get("skipped"))
+    skipped = "; ".join(f"{r['label']} ({r['name']}): {r.get('error')}" for r in channels if r.get("skipped"))
+    if (post.get("publish_results") or {}).get("dry_run"):
+        sent_to += " [test mode: nothing was really posted]"
+    await note(post_id, (f"Published to {sent_to}" if sent_to else "Publishing failed")
+               + (f" · problems: {problems}" if problems else "") + (f" · {skipped}" if skipped else "")
+               + (f" · {post['error']}" if post.get("error") else ""))
+    try:
+        await emailer.send_published(post)
+    except Exception:
+        log.exception("Could not send publish report")
+    return post
+
+
+async def publish_due(now=None) -> None:
+    """Called every minute: send out posts whose time has come."""
+    store = get_store()
+    now = now or now_utc()
+    for post in await store.posts_in_status(["scheduled"]):
+        when = parse(post.get("scheduled_for"))
+        if when and when > now:
+            continue
+        if when and now - when > LATE_LIMIT:
+            missed = await store.claim(post["id"], ["scheduled"], "missed", error=None,
+                                       stage_note=f"Missed {fmt(when)}: the server was offline. Press Publish now.")
+            if missed:
+                await note(post["id"], f"Missed its time ({fmt(when)}): the server was offline", "schedule")
+                await emailer.alert_missed(missed)
+            continue
+        await _publish(post["id"], ["scheduled"], why=f"Its time came ({fmt(when) if when else 'now'}) → publishing",
+                       by="schedule")
+    for post in await store.posts_in_status(["pending_review"]):
+        when = parse(post.get("scheduled_for"))
+        prefs = post.get("prefs") or {}
+        if when and when <= now and now - when <= LATE_LIMIT and prefs.get("if_no_answer") == "publish":
+            await _publish(post["id"], ["pending_review"], by="schedule",
+                           why=f"Not approved by its time ({fmt(when)}) → publishing anyway, as set on the Schedule page")
+
+
+async def resume_after_restart() -> None:
+    """Posts that were half-way when the server stopped continue automatically."""
+    store = get_store()
+    for post in await store.posts_in_status(WORKING):
+        spawn(generate(post["id"]))
+    for post in await store.posts_in_status(["publishing"]):
+        await store.update_post(post["id"], status="publish_failed", stage_note="Server restarted while publishing",
+                                error="The server restarted during publishing. Check Buffer before pressing Retry.")

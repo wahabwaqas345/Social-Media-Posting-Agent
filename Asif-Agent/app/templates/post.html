@@ -1,0 +1,287 @@
+{% extends "base.html" %}
+{% from "_icons.html" import icon %}
+{% block title %}Post{% endblock %}
+{% set c = post.captions or {} %}
+{% set b = post.brief or {} %}
+{% set prefs = post.prefs or {} %}
+{% set working = post.status in ["queued", "writing", "imaging", "designing", "emailing", "publishing"] %}
+{% set media = prefs.media %}
+{% block content %}
+<a class="back" href="/">{{ icon("arrow-left", 16) }} All posts</a>
+<div class="grid2 post-page">
+  <div class="stack media-col">
+    {% if media and media.kind == "video" %}
+      <div class="media-frame">
+        {% if media.video.removed %}
+          <img class="bigimg" src="{{ media.poster.url }}" alt="Video cover">
+          <p class="muted small" style="margin:10px 4px 2px">The video file was removed from storage a week after publishing. It is still on the social networks.</p>
+        {% else %}
+          <video class="bigimg" controls playsinline preload="metadata" poster="{{ media.poster.url }}" src="{{ media.video.url }}"></video>
+        {% endif %}
+        <div class="media-facts">{{ icon("video", 15) }} Your video · {{ media.video.duration|clock }} · {{ media.video.width }}×{{ media.video.height }} · {{ "%.1f"|format(media.video.size / 1048576) }} MB</div>
+      </div>
+    {% elif media %}
+      <div class="media-frame">
+        <img class="bigimg" id="car-main" src="{{ media["items"][0].url }}" alt="Your photo">
+        {% if media.kind == "carousel" %}
+        <div class="car-strip" id="car-strip">
+          {% for item in media["items"] %}<button type="button" class="{{ 'on' if loop.first }}" data-src="{{ item.url }}" aria-label="Photo {{ loop.index }}"><img src="{{ item.thumb }}" alt=""><span>{{ loop.index }}</span></button>{% endfor %}
+        </div>
+        {% endif %}
+        <div class="media-facts">{{ icon("image", 15) }} Your {{ media|media_label }}{% if media["items"]|selectattr("fitted")|list %} · soft background added to fit Instagram's shape{% endif %}</div>
+      </div>
+    {% elif post.final_image_url and not working %}
+      <div class="media-frame"><img class="bigimg" src="{{ b._thumb or post.final_image_url }}" data-full="{{ post.final_image_url }}" alt="Post image"></div>
+    {% else %}
+      <div class="card thumb"><div class="wait">{% if working %}<div class="spinner"></div>{% endif %}{{ post.stage_note or "" }}</div></div>
+    {% endif %}
+    {% if post.history %}
+    <div class="card">
+      <h3 class="card-title">{{ icon("layers", 17) }} Earlier versions (rejected)</h3>
+      <div class="versions">
+        {% for h in post.history|reverse %}
+        <a href="{{ h.final_image_url or '#' }}" target="_blank" title="{{ h.reason or 'no reason given' }}">
+          {% if h.final_image_url %}<img src="{{ (h.brief or {})._thumb or h.final_image_url }}" alt="" loading="lazy">{% endif %}
+          <span class="muted small">v{{ h.attempt }}{% if h.reason %}: {{ h.reason[:40] }}{% endif %}</span>
+        </a>
+        {% endfor %}
+      </div>
+    </div>
+    {% endif %}
+  </div>
+
+  <div class="stack">
+    <div class="card stack panel-main">
+      <div class="row" style="justify-content:space-between">
+        <span id="badge"></span>
+        <span class="muted small">Version {{ post.attempt }} · {{ post.created_at|ago }}</span>
+      </div>
+      <h1 class="post-title">{{ c.title or post.idea }}</h1>
+      <p class="muted small" style="margin:0">
+        {% if media %}Your own {{ media|media_label }}{% if prefs.note %} · your note: “{{ prefs.note }}”{% endif %} · the AI writes the title and captions
+        {% elif post.idea.startswith("Auto: ") %}Topic picked by the agent: {{ post.idea[6:] }}{% else %}Idea: “{{ post.idea }}”{% endif %}
+      </p>
+      {% if when and post.status not in ["published", "cancelled", "missed"] %}
+      <div class="alert info">{{ icon("clock", 16) }} <span>{% if post.status == "scheduled" %}Goes out on {% endif %}<b>{{ when|dubai }}</b> (Dubai time)
+        {% if prefs.source == "schedule" %}· from your daily schedule{% endif %}
+        {% if prefs.auto_publish %}· <b>fully automatic</b>{% elif post.status == "scheduled" %}· approved{% endif %}
+        {% if post.status == "pending_review" and future %}<br>Approve it and it goes out at that time.{% endif %}
+        {% if post.status == "pending_review" and not future %}<br>Its time has passed: approving publishes it right away.{% endif %}</span>
+      </div>
+      {% endif %}
+      {% if post.status == "published" and post.published_at %}<p class="muted small" style="margin:0">Published {{ post.published_at|dubai }} (Dubai time)</p>{% endif %}
+      {% if post.error %}<div class="alert bad">{{ post.error }}</div>{% endif %}
+      {% if working or post.status in ["missed", "cancelled"] or (post.status == "scheduled" and not when) %}<div class="alert info">{{ post.stage_note }}</div>{% endif %}
+
+      {% if post.status == "pending_review" %}
+      <div class="row">
+        <button class="btn green big" onclick="act('approve')">{{ icon("check", 18) }} {% if future %}Approve for {{ when|dubai }}{% else %}Approve &amp; Publish{% endif %}</button>
+        <button class="btn ghost" onclick="api('POST','/api/posts/{{ post.id }}/resend').then(()=>toast('Email sent again'),e=>toast(e.message,true))">{{ icon("mail", 16) }} Re-send email</button>
+      </div>
+      {% endif %}
+      {% if can.publish_now and post.status != "pending_review" or (post.status == "pending_review" and future) %}
+      <div class="row">
+        <button class="btn {{ 'big' if post.status != 'pending_review' else 'ghost' }}" onclick="act('publish-now')">{{ icon("send", 16) }} Publish now</button>
+        {% if post.status == "pending_review" %}<span class="muted small">Skips the planned time and posts immediately.</span>{% endif %}
+      </div>
+      {% endif %}
+      {% if can.reject %}
+      <div class="subpanel">
+        {% if media %}
+        <label class="lbl" for="reason">Not happy with the text? Tell the AI what to change (optional)</label>
+        <textarea id="reason" rows="2" placeholder="e.g. Shorter, more professional, mention it was done in Al Quoz"></textarea>
+        <div class="row" style="margin-top:10px"><button class="btn red" onclick="act('reject')">{{ icon("refresh", 16) }} Write new captions</button>
+          <span class="muted small">{{ "Your video stays" if media.kind == "video" else "Your photos stay" }} the same.</span></div>
+        {% else %}
+        <label class="lbl" for="reason">Not happy? Tell the AI what to change (optional)</label>
+        <textarea id="reason" rows="2" placeholder="e.g. Use a darker look, focus on data centers, shorter text"></textarea>
+        <div class="row" style="margin-top:10px"><button class="btn red" onclick="act('reject')">{{ icon("refresh", 16) }} Reject &amp; make a new version</button></div>
+        {% endif %}
+      </div>
+      {% endif %}
+      {% if post.status in ["failed", "publish_failed", "partly_published"] %}
+      <div class="row"><button class="btn big" onclick="act('retry')">{{ icon("refresh", 17) }} Retry</button>
+        <span class="muted small">{% if post.status == "failed" %}Continues from the step that failed.{% else %}Retries only the platforms that failed.{% endif %}</span></div>
+      {% endif %}
+      {% if can.reschedule %}
+      <div class="subpanel">
+        <label class="lbl" for="new-time">{% if when %}Change the publish time{% else %}Publish at a set time instead{% endif %} (Dubai)</label>
+        <div class="row">
+          <input type="datetime-local" id="new-time" min="{{ min_time }}" value="{{ post.scheduled_for|local_input if future else '' }}">
+          <button class="btn ghost" onclick="reschedule()">{{ icon("clock", 16) }} Save time</button>
+        </div>
+      </div>
+      {% endif %}
+      {% if can.cancel %}
+      <div class="row"><button class="btn ghost danger" onclick="act('cancel')">{{ icon("ban", 16) }} Cancel this post</button>
+        <span class="muted small">Nothing will be published.</span></div>
+      {% endif %}
+    </div>
+
+    {% if layouts %}
+    <div class="card" id="layouts">
+      <h3 class="card-title">{{ icon("layers", 17) }} Try other layouts</h3>
+      <p class="muted small" style="margin:-6px 0 14px">Same picture and text. Tap one to use it: the post is redrawn and a new approval email is sent.</p>
+      <div class="layout-grid">
+        {% for l in layouts %}
+        <button type="button" class="layout-opt{{ ' on' if l.current }}{{ ' covers' if l.covers_face }}" data-layout="{{ l.key }}"
+                {{ 'disabled' if l.current or l.covers_face }} title="{{ 'Covers a face in this picture' if l.covers_face else l.name }}">
+          <span class="layout-img">{% if previews[l.key] %}<img src="{{ previews[l.key] }}" alt="" decoding="async">{% endif %}</span>
+          <span class="layout-name">{{ l.name }}{% if l.current %} · current{% elif l.covers_face %} · covers a face{% endif %}</span>
+        </button>
+        {% endfor %}
+      </div>
+    </div>
+    {% endif %}
+
+    {% if events %}
+    <div class="card">
+      <h3 class="card-title">{{ icon("activity", 17) }} Activity</h3>
+      <ul class="activity">
+        {% for e in events %}
+        <li><span class="when-at">{{ e.at|dubai }}</span> {{ e.what }}{% if e.by and e.by != "system" %} <span class="by">{{ e.by }}</span>{% endif %}</li>
+        {% endfor %}
+      </ul>
+    </div>
+    {% endif %}
+
+    {% if post.publish_results %}
+    <div class="card">
+      <h3 class="card-title">{{ icon("send", 17) }} Publishing{% if post.publish_results.dry_run %} (test mode, nothing posted){% endif %}</h3>
+      <ul class="results">
+        {% for r in post.publish_results.channels %}
+        <li>{{ "✅" if r.ok else "⏭️" if r.skipped else "❌" }} <b>{{ r.label }}</b> <span class="muted">{{ r.name }}</span>{% if r.error %}: <span class="small" style="color:var(--red)">{{ r.error }}</span>{% endif %}</li>
+        {% endfor %}
+      </ul>
+    </div>
+    {% endif %}
+
+    {% if c %}
+    <div class="card">
+      <h3 class="card-title">{{ icon("edit", 17) }} {% if media %}Title and captions{% else %}Captions{% endif %}</h3>
+      {% if media and c.title %}
+      <div class="caption-head"><b>Title <span class="muted" style="font-weight:400">· video title on Facebook, TikTok and Pinterest title</span></b>
+        <button class="copy" onclick="copyText(this,'cap-title')">Copy</button></div>
+      <div class="caption" id="cap-title">{{ c.title }}</div>
+      {% endif %}
+      {% for label, key in [("Facebook", "facebook"), ("Instagram", "instagram"), ("LinkedIn", "linkedin"), ("X (Twitter)", "x"),
+                            ("Threads", "threads"), ("TikTok", "tiktok"), ("Pinterest", "pinterest"), ("Google Business", "googlebusiness"),
+                            ("Bluesky", "bluesky"), ("Mastodon", "mastodon"), ("Substack", "substack")] if c[key] %}
+      <div class="caption-head"><b>{{ label }} <span class="muted" style="font-weight:400">· {{ (c[key] or "")|length }} chars</span></b>
+        <button class="copy" onclick="copyText(this,'cap-{{ key }}')">Copy</button></div>
+      <div class="caption" id="cap-{{ key }}">{{ c[key] }}</div>
+      {% endfor %}
+      {% if c.threads_topic %}<p class="muted small">Threads topic: {{ c.threads_topic }}</p>{% endif %}
+      {% if c.tiktok_title %}<p class="muted small">TikTok title: {{ c.tiktok_title }}</p>{% endif %}
+      {% if c.pinterest_title %}<p class="muted small">Pin title: {{ c.pinterest_title }}</p>{% endif %}
+    </div>
+    {% endif %}
+
+    {% if b %}
+    <div class="card">
+      <h3 class="card-title">{{ icon("info", 17) }} Behind the scenes</h3>
+      {% if media %}
+      <dl class="kv">
+        <dt>Media</dt><dd>Your {{ media|media_label }}{% if media.kind == "video" and media.video.codec == "hevc" %} · HEVC (H.265){% endif %}</dd>
+        <dt>Service</dt><dd>{{ b.service }}</dd>
+        <dt>Angle</dt><dd>{{ b.angle }}</dd>
+        <dt>What the AI saw</dt><dd>{{ b.what_we_see }}</dd>
+        {% if b.visible_text %}<dt>Text in it</dt><dd>{{ b.visible_text }}</dd>{% endif %}
+        {% if b.spoken_in_video %}<dt>Said in the video</dt><dd class="small">{{ b.spoken_in_video }}</dd>{% endif %}
+        {% if b._quality %}<dt>AI's note</dt><dd style="color:var(--amber)">{{ b._quality }}</dd>{% endif %}
+        <dt>AI</dt><dd class="small">{{ b._model }}{% if c._model and c._model != b._model %} / {{ c._model }}{% endif %}</dd>
+      </dl>
+      {% else %}
+      <dl class="kv">
+        <dt>Layout</dt><dd>{{ LAYOUT_NAMES.get(b.template, b.template) }}{% if b._faces %} · {{ b._faces|length }} face{{ 's' if b._faces|length > 1 }} found, kept free of text{% endif %}</dd>
+        <dt>Service</dt><dd>{{ b.service }}</dd>
+        <dt>Angle</dt><dd>{{ b.angle }}</dd>
+        <dt>On the image</dt><dd>{{ b.headline_top }} <b>{{ b.headline_highlight }}</b>{% if b.subheadline %} · {{ b.subheadline }}{% endif %}{% if b.body %} · {{ b.body }}{% endif %}</dd>
+        {% if b.benefits %}<dt>Benefits</dt><dd>{{ b.benefits|join(" · ") }}</dd>{% endif %}
+        <dt>Image prompt</dt><dd class="small">{{ b.image_prompt }}</dd>
+        {% if b._plan %}<dt>Variety plan</dt><dd class="small">{{ b._plan.post_type|replace("_", " ") }} · for {{ b._plan.industry }} · {{ b._plan.person }} · {{ b._plan.setting }} · {{ b._plan.shot }} · {{ b._plan.light }} · caption: {{ b._plan.caption_style }}</dd>{% endif %}
+        {% if b._variety_warning or c._variety_warning %}<dt>Variety</dt><dd class="small" style="color:var(--amber)">Could not fully avoid: {{ ((b._variety_warning or []) + (c._variety_warning or []))|join("; ") }}</dd>{% endif %}
+        <dt>Text AI</dt><dd class="small">{{ b._model }}{% if c._model and c._model != b._model %} / {{ c._model }}{% endif %}</dd>
+        {% if b._gemini_account %}<dt>Gemini account</dt><dd>{{ b._gemini_account }}</dd>{% endif %}
+      </dl>
+      {% endif %}
+    </div>
+    {% endif %}
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+document.getElementById("badge").innerHTML = badge({{ post.status|tojson }});
+// previews not made yet appear by themselves as soon as they are ready
+(function fillPreviews(round = 0) {
+  const empty = [...document.querySelectorAll(".layout-opt")].filter((b) => !b.querySelector("img"));
+  if (!empty.length || round > 60) return;
+  setTimeout(async () => {
+    try {
+      const ready = await api("GET", "/api/posts/{{ post.id }}/previews");
+      empty.forEach((b) => {
+        const url = ready[b.dataset.layout];
+        if (url) b.querySelector(".layout-img").innerHTML = `<img src="${esc(url)}" alt="" decoding="async">`;
+      });
+    } catch (e) {}
+    fillPreviews(round + 1);
+  }, 2500);
+})();
+document.getElementById("layouts")?.addEventListener("click", async (e) => {
+  const b = e.target.closest("button[data-layout]");
+  if (!b || b.disabled) return;
+  document.querySelectorAll(".layout-opt").forEach((x) => (x.disabled = true));
+  b.classList.add("busy");
+  try {
+    await api("POST", "/api/posts/{{ post.id }}/layout", { layout: b.dataset.layout });
+    toast("Changing the layout… a new approval email follows.");
+    setTimeout(() => location.reload(), 900);
+  } catch (err) {
+    toast(err.message, true);
+    setTimeout(() => location.reload(), 1500);
+  }
+});
+document.getElementById("car-strip")?.addEventListener("click", (e) => {  // carousel: show the photo that was tapped
+  const b = e.target.closest("button[data-src]");
+  if (!b) return;
+  document.getElementById("car-main").src = b.dataset.src;
+  document.querySelectorAll("#car-strip button").forEach((x) => x.classList.toggle("on", x === b));
+});
+const CONFIRM = {
+  approve: {{ (("Approve this post? It will be published on " ~ (when|dubai) ~ " (Dubai time) to " ~ targets ~ ".") if future else "Publish this post to " ~ targets ~ " now?")|tojson }},
+  "publish-now": {{ ("Publish this post to " ~ targets ~ " right now?")|tojson }},
+  cancel: "Cancel this post? Nothing will be published.",
+};
+async function act(what) {
+  const body = what === "reject" ? { reason: document.getElementById("reason").value } : undefined;
+  if (CONFIRM[what] && !confirm(CONFIRM[what])) return;
+  document.querySelectorAll("button").forEach((b) => (b.disabled = true));
+  try {
+    await api("POST", `/api/posts/{{ post.id }}/${what}`, body);
+    location.reload();
+  } catch (e) {
+    toast(e.message, true);
+    document.querySelectorAll("button").forEach((b) => (b.disabled = false));
+  }
+}
+async function reschedule() {
+  const v = document.getElementById("new-time").value;
+  if (!v) return toast("Pick a date and time", true);
+  try {
+    await api("POST", "/api/posts/{{ post.id }}/reschedule", { publish_at: v });
+    location.reload();
+  } catch (e) { toast(e.message, true); }
+}
+{% if working %}
+setTimeout(async function check() {
+  try {
+    const p = await api("GET", "/api/posts/{{ post.id }}");
+    if (p.status !== {{ post.status|tojson }}) return location.reload();
+  } catch (e) {}
+  setTimeout(check, 3000);
+}, 3000);
+{% endif %}
+</script>
+{% endblock %}

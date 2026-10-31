@@ -1,0 +1,19 @@
+{% extends "base.html" %}
+{% block title %}{{ title }}{% endblock %}
+{% block content %}
+<div class="center">
+  <div class="card narrow stack notice-card">
+    <img src="/brand-assets/logo/logo-main-original.png" alt="{{ brand.name }}" class="notice-logo">
+    <h1 style="font-size:22px">{{ title }}</h1>
+    {% if text %}<p class="muted" style="margin:0">{{ text }}</p>{% endif %}
+    {% if results %}
+    <ul class="results" style="text-align:left">
+      {% for r in results %}
+      <li>{{ "✅" if r.ok else "⏭️" if r.skipped else "❌" }} <b>{{ r.label }}</b> <span class="muted">{{ r.name }}</span>{% if r.error %}: <span class="small" style="color:var(--red)">{{ r.error }}</span>{% endif %}</li>
+      {% endfor %}
+    </ul>
+    {% endif %}
+    {% if post and post.final_image_url %}<img class="bigimg" src="{{ (post.brief or {})._thumb or post.final_image_url }}" data-full="{{ post.final_image_url }}" alt="">{% endif %}
+  </div>
+</div>
+{% endblock %}

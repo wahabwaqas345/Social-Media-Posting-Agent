@@ -1,0 +1,79 @@
+{% from "_icons.html" import icon %}<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#0B1230">
+  <title>{% block title %}Post Agent{% endblock %} · {{ brand.name }}</title>
+  <link rel="icon" href="/brand-assets/logo/logo-icon-original.png">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Montserrat:wght@700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="{{ static_url('app.css') }}">
+</head>
+<body class="{% block body_class %}{% endblock %}">
+{% if request.session.get('auth') %}
+<header class="top">
+  <div class="top-in">
+    <a class="top-brand" href="/">
+      <img src="/brand-assets/logo/logo-white-original.png" alt="{{ brand.name }}">
+      <span>Post Agent</span>
+    </a>
+    <nav>
+      <a href="/" class="{{ 'on' if request.url.path == '/' }}">{{ icon("grid", 17) }}<b>Posts</b></a>
+      <a href="/schedule" class="{{ 'on' if request.url.path == '/schedule' }}">{{ icon("calendar", 17) }}<b>Schedule</b></a>
+      <a href="/upload" class="{{ 'on' if request.url.path == '/upload' }}">{{ icon("upload", 17) }}<b>Upload</b></a>
+      <a href="/demos" class="{{ 'on' if request.url.path == '/demos' }}">{{ icon("image", 17) }}<b>Demos</b></a>
+    </nav>
+    <div class="top-right">
+      {% if now_dubai %}<span class="top-time" title="Dubai time">{{ icon("clock", 15) }}{{ now_dubai }}</span>{% endif %}
+      <a href="/logout" class="top-out" title="Log out">{{ icon("logout", 17) }}<b>Log out</b></a>
+    </div>
+  </div>
+</header>
+{% endif %}
+{% if settings.dry_run_publish and request.session.get('auth') %}
+<div class="banner">{{ icon("info", 15) }} Test mode is on (DRY_RUN_PUBLISH=true): approving a post does everything except actually posting.</div>
+{% endif %}
+<main class="wrap">{% block content %}{% endblock %}</main>
+<div id="toast" class="toast" hidden></div>
+{% if request.session.get('auth') %}
+{% macro bot(cls="") -%}
+<span class="bot {{ cls }}" data-mood="idle" aria-hidden="true">
+  <span class="bot-antenna"><i></i></span>
+  <span class="bot-head"><span class="bot-face">
+    <span class="eye l"></span><span class="eye r"></span><span class="mouth"></span>
+    <span class="cheek l"></span><span class="cheek r"></span>
+  </span></span>
+</span>
+{%- endmacro %}
+<div class="ai" id="ai">
+  <div class="ai-bubble" id="ai-bubble" hidden>Hi! I can write a fresh post prompt for you ✨</div>
+  <button type="button" class="ai-fab" id="ai-fab" aria-label="Open Amana, the AI prompt assistant" aria-expanded="false" aria-controls="ai-panel">
+    <span class="ai-halo"></span>{{ bot("big") }}
+    <span class="ai-sparks" aria-hidden="true"><i></i><i></i><i></i><i></i></span>
+  </button>
+  <section class="ai-panel" id="ai-panel" role="dialog" aria-label="Amana, the AI prompt assistant" hidden>
+    <header class="ai-head">
+      <span class="ai-head-bot">{{ bot() }}</span>
+      <div class="ai-head-txt"><b>Amana</b><span id="ai-status"><i class="dot"></i>Prompt assistant · ready</span></div>
+      <button type="button" class="ai-icon-btn" id="ai-new" title="New chat" aria-label="Start a new chat">{{ icon("refresh", 16) }}</button>
+      <button type="button" class="ai-icon-btn" id="ai-close" title="Close" aria-label="Close">{{ icon("x", 18) }}</button>
+    </header>
+    <div class="ai-log" id="ai-log" aria-live="polite"></div>
+    <div class="ai-quick" id="ai-quick">
+      <button type="button">CCTV for a warehouse</button><button type="button">AI receptionist for a clinic</button>
+      <button type="button">Fiber cabling in a new office</button><button type="button">Surprise me</button>
+    </div>
+    <form class="ai-input" id="ai-form">
+      <textarea id="ai-text" rows="1" maxlength="2000" placeholder="Tell me your idea…" aria-label="Your message"></textarea>
+      <button type="submit" class="ai-send" id="ai-send" aria-label="Send">{{ icon("send", 18) }}</button>
+    </form>
+  </section>
+</div>
+{% endif %}
+<script src="{{ static_url('app.js') }}"></script>
+{% if request.session.get('auth') %}<script src="{{ static_url('assistant.js') }}"></script>{% endif %}
+{% block scripts %}{% endblock %}
+</body>
+</html>
